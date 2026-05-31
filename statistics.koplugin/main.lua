@@ -1380,7 +1380,7 @@ function ReaderStatistics:addToMainMenu(menu_items)
             {
                 text = _("Enabled"),
                 checked_func = function() return self.settings.is_enabled end,
-                callback = function() self:onToggleStatistics(true) end,
+                callback = function() self:onToggleStatistics() end,
             },
             {
                 text = _("Settings"),
@@ -3329,6 +3329,37 @@ function ReaderStatistics.onSync(local_path, cached_path, income_path)
     conn:exec("DETACH income_db;"..(attached_cache and "DETACH cached_db;" or ""))
     conn:close()
     return true
+end
+
+-- Yanllsama: Kopan ac/kapat salterini yerine taktik
+function ReaderStatistics:onToggleStatistics(enable)
+    if enable ~= nil and enable == self.settings.is_enabled then return end
+    
+    self.settings.is_enabled = enable == nil and not self.settings.is_enabled or enable
+    G_reader_settings:saveSetting("statistics", self.settings)
+    
+    -- === MİMARIN DİL MOTORU ===
+    local lang = G_reader_settings and G_reader_settings:readSetting("language") or "en"
+    local is_tr = (string.sub(lang, 1, 2) == "tr")
+    
+    if self.settings.is_enabled then
+        if self.document then
+            self:initData()
+        end
+        UIManager:show(InfoMessage:new{
+            text = is_tr and "Okuma istatistikleri açıldı." or "Reading statistics enabled.",
+            timeout = 2,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = is_tr and "Okuma istatistikleri kapatıldı." or "Reading statistics disabled.",
+            timeout = 2,
+        })
+    end
+    
+    if self.ui.menu then
+        self.ui.menu:updateConfig("statistics")
+    end
 end
 
 return ReaderStatistics

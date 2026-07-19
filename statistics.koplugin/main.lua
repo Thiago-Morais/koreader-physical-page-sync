@@ -2,7 +2,6 @@ local BD = require("ui/bidi")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
-
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local DocSettings = require("docsettings")
@@ -12,7 +11,6 @@ local Math = require("optmath")
 local ReaderProgress = require("readerprogress")
 local ReadHistory = require("readhistory")
 local SQ3 = require("lua-ljsqlite3/init")
-local SyncService = require("frontend/apps/cloudstorage/syncservice")
 local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local datetime = require("datetime")
@@ -157,7 +155,6 @@ function ReaderStatistics:onColorRenderingUpdate()
     self.color = self:useColorRendering()
 end
 
--- === KAYA'NIN KUSURSUZ SENKRON MOTORU ===
 function ReaderStatistics:applyPerfectSync(physical_pages)
     local document = self.document
     local doc_settings = self.ui.doc_settings
@@ -251,8 +248,6 @@ end
 function ReaderStatistics:initData()
     self.is_doc = true
 
-    -- yanllsama: Kitap onceden 265 sayfa iken "okundu" (complete) isaretlenmisse
-    -- fiziksel sayfalari 384 yapinca kitap hala complete kalir ve "freeze" yuzunden istatistik tutmaz!
     local summary = self.ui.doc_settings:readSetting("summary")
     local physical_pages = self.ui.doc_settings:readSetting("yanllsama_physical_pages")
     if physical_pages and summary.status == "complete" then
@@ -265,6 +260,7 @@ function ReaderStatistics:initData()
     self.is_doc_not_finished = summary.status ~= "complete"
     self.is_doc_not_frozen = self.is_doc_not_finished or not self.settings.freeze_finished_books
 
+    -- first execution
     local book_properties = self.ui.doc_props
     self.data.title = book_properties.display_title
     self.data.authors = book_properties.authors or "N/A"
@@ -277,9 +273,6 @@ function ReaderStatistics:initData()
         end
     end
     self.data.series = series or "N/A"
-
-    -- ==========================================
-    -- ==========================================
     local physical_pages = self.ui.doc_settings:readSetting("yanllsama_physical_pages")
     if physical_pages then
         self.data.pages = physical_pages
@@ -304,11 +297,6 @@ function ReaderStatistics:initData()
             return this:_yanllsama_orig_getStatReadPages()
         end
     end
-    -- ==========================================
-    -- Kitap Haritasi Duzeltmesi
-    -- applyPerfectSync ~384 sayfa uretir. Motor tam 384 uremeyebilir.
-    -- BookMapWidget.update'te getPageCount'u wrap edip nb_pages = physical_pages yapiyoruz.
-    -- ==========================================
     if physical_pages then
         local BookMapWidget = require("ui/widget/bookmapwidget")
         if not BookMapWidget._yanllsama_orig_update then
@@ -378,15 +366,12 @@ function ReaderStatistics:initData()
             end
         end
     end
-    -- ==========================================
+    -- Update these numbers to what's actually stored in the settings
     self.data.highlights, self.data.notes = self.ui.annotation:getNumberOfHighlightsAndNotes()
     self.id_curr_book = self:getIdBookDB()
     if not self.id_curr_book then return end
-    
-    -- ==========================================
-    -- DB Guncellemesi (Fiziksel Sayfalari DB'ye Sabitle)
-    -- ==========================================
-    if physical_pages then
+
+        if physical_pages then
         local SQ3 = require("sq3")
         local db_location = self.settings.db_file
         if db_location then
@@ -397,12 +382,12 @@ function ReaderStatistics:initData()
             end
         end
     end
-    -- ==========================================
 
     self.book_read_pages, self.book_read_time = self:getPageTimeTotalStats(self.id_curr_book)
     if self.book_read_pages > 0 then
         self.avg_time = self.book_read_time / self.book_read_pages
     else
+        -- NOTE: Possibly less weird-looking than initializing this to 0?
         self.avg_time = math.floor(0.50 * self.settings.max_sec)
         logger.dbg("ReaderStatistics: Initializing average time per page at 50% of the max value, i.e.,", self.avg_time)
     end
@@ -416,23 +401,45 @@ function ReaderStatistics:isEnabledAndNotFrozen()
     return self.settings.is_enabled and self.is_doc_not_frozen
 end
 
+-- Reset the (volatile) stats on page count changes (e.g., after a font size update)
 function ReaderStatistics:onDocumentRerendered()
-    local new_pagecount = self.document:getPageCount()
+    -- Note: this is called *after* onPageUpdate(new current page in new page count), which
+    -- has updated the duration for (previous current page in old page count) and created
+    -- a tuple for (new current page) with a 0-duration.
+    -- The insertDB() call below will save the previous page stat correctly with the old
+    -- page count, and will drop the new current page stat.
+    -- Only after this insertDB(), self.data.pages is updated with the new page count.
+    --
+    -- To make this clearer, here's what happens with an example:
+    -- - We were reading page 127/200 with latest self.page_stat[127]={..., {now-35s, 0}}
+    -- - Increasing font size, re-rendering... going to page 153/254
+    -- - OnPageUpdate(153) is called:
+    --   - it updates duration in self.page_stat[127]={..., {now-35s, 35}}
+    --   - it adds/creates self.page_stat[153]={..., {now, 0}}
+    --   - it sets self.curr_page=153
+    --   - (at this point, we don't know the new page count is 254)
+    -- - OnDocumentRerendered() is called:
+    --   - insertDB() is called, which will still use the previous self.data.pages=200 as the
+    --     page count, and will go at inserting or not in the DB:
+    --       - (127, now-35s, 35, 200) inserted
+    --       - (153, now, 0, 200) not inserted as 0-duration (and using 200 for its associated
+    --         page count would be erroneous)
+    --     and will restore self.page_stat[153]={{now, 0}}
+    --   - we only then update self.data.pages=254 as the new page count
+    -- - 5 minutes later, on the next insertDB(), (153, now-5mn, 42, 254) will be inserted in DB
 
-    -- ==========================================
-    -- yanllsama: Fiziksel Sayfa Kilidi (2)
-    -- ==========================================
+    local new_pagecount = self.document:getPageCount()
     local physical_pages = self.ui.doc_settings:readSetting("yanllsama_physical_pages")
     if physical_pages then
         new_pagecount = physical_pages
     end
-    -- ==========================================
-
     if new_pagecount ~= self.data.pages then
         logger.dbg("ReaderStatistics: Pagecount change, flushing volatile book statistics")
+        -- Flush volatile stats to DB for current book, and update pagecount and average time per page stats
         self:insertDB(new_pagecount)
     end
 
+    -- Update our copy of the page count
     self.data.pages = new_pagecount
     -- yanllsama: Rerender sonrasi Ninja Motor v4 cache'lerini sifirla
     self._yanllsama_pagemap_list = nil
@@ -468,8 +475,6 @@ function ReaderStatistics:resetVolatileStats(now_ts)
     -- Re-seed the volatile stats with minimal data about the current page.
     -- If a timestamp is passed, it's the caller's responsibility to ensure that self.curr_page is accurate.
     if now_ts then
-        -- yanllsama v4: sync_enabled ise doğru anahtar fiziksel sayfa numarasıdır
-        -- Pagemap modunda getCurrentPageLabel(); yoksa ratio ile tahmin et.
         local stat_key = self.curr_page
         if self.ui and self.ui.doc_settings then
             local se = self.ui.doc_settings:readSetting("yanllsama_sync_enabled")
@@ -529,7 +534,7 @@ function ReaderStatistics:getStatsBookStatus()
     if p then
         if total_read_pages > p then total_read_pages = p end
     end
-
+    
     return {
         days = tonumber(total_days),
         time = tonumber(total_time_book) or 0,
@@ -1171,8 +1176,6 @@ function ReaderStatistics:insertDB(updated_pagecount)
     -- in the insertion, and its start ts would be lost. We'll give it
     -- to resetVolatileStats() so it can restore it
     local cur_page_start_ts = now_ts
-    -- yanllsama: sync_enabled durumunda page_stat fiziksel numaralarla anahtarlanıyor;
-    -- curr_page ekran numarası olduğu için doğru anahtarı hesaplamak gerekir.
     local _stat_curr_key = self.curr_page
     do
         local ratio = self.ui and self.ui.doc_settings and
@@ -1242,7 +1245,6 @@ function ReaderStatistics:insertDB(updated_pagecount)
         WHERE  id = ?;
     ]]
     stmt = conn:prepare(sql_stmt)
-    -- yanllsama: Fiziksel sayfa kilidi varsa updated_pagecount'u yoksay, kilidi koru
     local physical_pages_lock = self.ui and self.ui.doc_settings and
         self.ui.doc_settings:readSetting("yanllsama_physical_pages")
     local effective_pagecount = physical_pages_lock or (updated_pagecount and updated_pagecount or self.data.pages)
@@ -1309,6 +1311,38 @@ function ReaderStatistics:getPageTimeTotalStats(id_book)
     return total_pages, total_time
 end
 
+function ReaderStatistics:onToggleStatistics(arg)
+    local no_notification, toggle
+    if type(arg) == "table" then -- Dispatcher-enable/disable
+        no_notification, toggle = unpack(arg)
+        if toggle == self.settings.is_enabled then return end
+    else -- Dispatcher-toggle or Menu-toggle
+        no_notification = arg
+        toggle = not self.settings.is_enabled
+    end
+    if self.settings.is_enabled then -- save data to file
+        self:insertDB()
+    end
+    self.settings.is_enabled = toggle
+    if self.is_doc then
+        if self.settings.is_enabled then
+            self:initData()
+            self.start_current_period = os.time()
+            self.curr_page = self.ui:getCurrentPage()
+            self:resetVolatileStats(self.start_current_period)
+        end
+        self.view.footer:maybeUpdateFooter()
+    end
+    if not no_notification then
+        local Notification = require("ui/widget/notification")
+        Notification:notify(self.settings.is_enabled and _("Statistics enabled") or _("Statistics disabled"))
+    end
+
+    if self.ui.menu then
+        self.ui.menu:updateConfig("statistics")
+    end
+end
+
 function ReaderStatistics:addToMainMenu(menu_items)
     -- === MİMARIN DİL MOTORU (LANGUAGE ENGINE) ===
     local lang = G_reader_settings and G_reader_settings:readSetting("language") or "en"
@@ -1321,9 +1355,6 @@ function ReaderStatistics:addToMainMenu(menu_items)
     menu_items.statistics = {
         text = _("Reading statistics"),
         sub_item_table = {
-            -- ==========================================
-            -- yanllsama'nın Nihai Fiziksel Sayfa Kontrol Merkezi
-            -- ==========================================
             {
                 text = L("⚙️ Fiziksel Sayfa Eşitleme", "⚙️ Physical Page Sync"),
                 sub_item_table = (self.document and self.ui and self.ui.doc_settings) and {
@@ -1424,7 +1455,6 @@ function ReaderStatistics:addToMainMenu(menu_items)
                                         end,
                                         cancel_callback = function()
                                             local total_screens = self.document:getPageCount() or physical_pages
-                                            -- yanllsama: Kesirli oran (float)
                                             local calculated_ratio = (total_screens / physical_pages)
                                             calculated_ratio = math.floor(calculated_ratio * 100 + 0.5) / 100
                                             self.ui.doc_settings:saveSetting("yanllsama_screen_ratio", calculated_ratio)
@@ -1626,7 +1656,6 @@ function ReaderStatistics:addToMainMenu(menu_items)
                             end
                             
                             local total_screens = self.document:getPageCount() or physical_pages
-                            -- yanllsama: Kesirli oran (float) - kullanıcı tavsiyesi doğrultusunda
                             local new_ratio = (total_screens / physical_pages)
                             new_ratio = math.floor(new_ratio * 100 + 0.5) / 100  -- 2 ondalık yuvarlama
                             
@@ -1709,9 +1738,6 @@ function ReaderStatistics:addToMainMenu(menu_items)
                                     
                                     if self.data and self.document then
                                         self.data.pages = self.document:getPageCount()
-                                        -- ==========================================
-                                        -- DB Guncellemesi (Orijinal Sayfalari DB'ye Geri Yukle)
-                                        -- ==========================================
                                         if self.id_curr_book and db_location then
                                             local conn = SQ3.open(db_location)
                                             if conn then
@@ -1719,7 +1745,6 @@ function ReaderStatistics:addToMainMenu(menu_items)
                                                 conn:close()
                                             end
                                         end
-                                        -- ==========================================
                                     end
                                     
                                     if type(self.resetLayout) == "function" then self:resetLayout() end
@@ -1770,26 +1795,56 @@ function ReaderStatistics:addToMainMenu(menu_items)
                 },
                 separator = true,
             },
-            -- KOReader Orijinal Menü Öğeleri Buradan Başlar
             {
                 text = _("Enabled"),
-                checked_func = function() return self.settings.is_enabled end,
-                callback = function() self:onToggleStatistics() end,
+                checked_func = function()
+                    return self.settings.is_enabled
+                end,
+                callback = function()
+                    self:onToggleStatistics(true) -- no notification
+                end,
             },
             {
                 text = _("Settings"),
                 sub_item_table = {
                     {
-                        text_func = function() return T(_("Read page duration limits: %1 s – %2 s"), self.settings.min_sec, self.settings.max_sec) end,
+                        text_func = function()
+                            return T(_("Read page duration limits: %1 s – %2 s"),
+                                self.settings.min_sec, self.settings.max_sec)
+                        end,
                         callback = function(touchmenu_instance)
                             local DoubleSpinWidget = require("ui/widget/doublespinwidget")
-                            UIManager:show(DoubleSpinWidget:new{
-                                left_text = C_("Extrema", "Min"), left_value = self.settings.min_sec, left_default = DEFAULT_MIN_READ_SEC, left_min = 0, left_max = 120, left_step = 1, left_hold_step = 10,
-                                right_text = C_("Extrema", "Max"), right_value = self.settings.max_sec, right_default = DEFAULT_MAX_READ_SEC, right_min = 10, right_max = 7200, right_step = 10, right_hold_step = 60,
-                                is_range = true, unit = C_("Time", "s"), title_text = _("Read page duration limits"),
-                                info_text = _("Set min and max time spent (in seconds) on a page for it to be counted as read in statistics."),
-                                callback = function(min, max) self.settings.min_sec = min; self.settings.max_sec = max; touchmenu_instance:updateItems() end,
-                            })
+                            local durations_widget
+                            durations_widget = DoubleSpinWidget:new{
+                                left_text = C_("Extrema", "Min"),
+                                left_value = self.settings.min_sec,
+                                left_default = DEFAULT_MIN_READ_SEC,
+                                left_min = 0,
+                                left_max = 120,
+                                left_step = 1,
+                                left_hold_step = 10,
+                                right_text = C_("Extrema", "Max"),
+                                right_value = self.settings.max_sec,
+                                right_default = DEFAULT_MAX_READ_SEC,
+                                right_min = 10,
+                                right_max = 7200,
+                                right_step = 10,
+                                right_hold_step = 60,
+                                is_range = true,
+                                -- @translators This is the time unit for seconds.
+                                unit = C_("Time", "s"),
+                                title_text = _("Read page duration limits"),
+                                info_text = _([[
+Set min and max time spent (in seconds) on a page for it to be counted as read in statistics.
+The min value ensures pages you quickly browse and skip are not included.
+The max value ensures a page you stay on for a long time (because you fell asleep or went away) will be included, but with a duration capped to this specified max value.]]),
+                                callback = function(min, max)
+                                    self.settings.min_sec = min
+                                    self.settings.max_sec = max
+                                    touchmenu_instance:updateItems()
+                                end,
+                            }
+                            UIManager:show(durations_widget)
                         end,
                         keep_menu_open = true,
                     },
@@ -1798,72 +1853,195 @@ function ReaderStatistics:addToMainMenu(menu_items)
                         checked_func = function() return self.settings.freeze_finished_books end,
                         callback = function()
                             self.settings.freeze_finished_books = not self.settings.freeze_finished_books
-                            self.is_doc_not_frozen = self.is_doc and (self.is_doc_not_finished or not self.settings.freeze_finished_books)
+                            self.is_doc_not_frozen = self.is_doc
+                                and (self.is_doc_not_finished or not self.settings.freeze_finished_books)
                         end,
                         separator = true,
                     },
                     {
-                        text_func = function() return T(_("Calendar weeks start on %1"), datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[self.settings.calendar_start_day_of_week]]) end,
+                        text_func = function()
+                            return T(_("Calendar weeks start on %1"),
+                                datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[self.settings.calendar_start_day_of_week]])
+                        end,
                         sub_item_table = {
-                            { text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[6]], checked_func = function() return self.settings.calendar_start_day_of_week == 6 end, radio = true, callback = function() self.settings.calendar_start_day_of_week = 6 end },
-                            { text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[7]], checked_func = function() return self.settings.calendar_start_day_of_week == 7 end, radio = true, callback = function() self.settings.calendar_start_day_of_week = 7 end },
-                            { text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[1]], checked_func = function() return self.settings.calendar_start_day_of_week == 1 end, radio = true, callback = function() self.settings.calendar_start_day_of_week = 1 end },
-                            { text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[2]], checked_func = function() return self.settings.calendar_start_day_of_week == 2 end, radio = true, callback = function() self.settings.calendar_start_day_of_week = 2 end },
+                            { -- Friday (Bangladesh and Maldives)
+                                text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[6]],
+                                checked_func = function() return self.settings.calendar_start_day_of_week == 6 end,
+                                radio = true,
+                                callback = function() self.settings.calendar_start_day_of_week = 6 end
+                            },
+                            { -- Saturday (some Middle East countries)
+                                text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[7]],
+                                checked_func = function() return self.settings.calendar_start_day_of_week == 7 end,
+                                radio = true,
+                                callback = function() self.settings.calendar_start_day_of_week = 7 end
+                            },
+                            { -- Sunday
+                                text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[1]],
+                                checked_func = function() return self.settings.calendar_start_day_of_week == 1 end,
+                                radio = true,
+                                callback = function() self.settings.calendar_start_day_of_week = 1 end
+                            },
+                            { -- Monday
+                                text = datetime.shortDayOfWeekToLongTranslation[datetime.weekDays[2]],
+                                checked_func = function() return self.settings.calendar_start_day_of_week == 2 end,
+                                radio = true,
+                                callback = function() self.settings.calendar_start_day_of_week = 2 end
+                            },
                         },
                     },
                     {
-                        text_func = function() return T(_("Books per calendar day: %1"), self.settings.calendar_nb_book_spans) end,
+                        text_func = function()
+                            return T(_("Books per calendar day: %1"), self.settings.calendar_nb_book_spans)
+                        end,
                         callback = function(touchmenu_instance)
                             local SpinWidget = require("ui/widget/spinwidget")
-                            UIManager:show(SpinWidget:new{ value = self.settings.calendar_nb_book_spans, value_min = 1, value_max = 5, default_value = DEFAULT_CALENDAR_NB_BOOK_SPANS, ok_text = _("Set"), title_text = _("Books per calendar day"), callback = function(spin) self.settings.calendar_nb_book_spans = spin.value; touchmenu_instance:updateItems() end })
+                            UIManager:show(SpinWidget:new{
+                                value = self.settings.calendar_nb_book_spans,
+                                value_min = 1,
+                                value_max = 5,
+                                default_value  = DEFAULT_CALENDAR_NB_BOOK_SPANS,
+                                ok_text = _("Set"),
+                                title_text =  _("Books per calendar day"),
+                                info_text = _("Set the max number of book spans to show for a day"),
+                                callback = function(spin)
+                                    self.settings.calendar_nb_book_spans = spin.value
+                                    touchmenu_instance:updateItems()
+                                end,
+                            })
                         end,
                         keep_menu_open = true,
                     },
-                    { text = _("Show hourly histogram in calendar days"), checked_func = function() return self.settings.calendar_show_histogram end, callback = function() self.settings.calendar_show_histogram = not self.settings.calendar_show_histogram end },
-                    { text = _("Allow browsing coming months"), checked_func = function() return self.settings.calendar_browse_future_months end, callback = function() self.settings.calendar_browse_future_months = not self.settings.calendar_browse_future_months end, separator = true },
                     {
-                        text_func = function() return T(_("Daily timeline starts at %1"), string.format("%02d:%02d", self.settings.calendar_day_start_hour or 0, self.settings.calendar_day_start_minute or 0)) end,
+                        text = _("Show hourly histogram in calendar days"),
+                        checked_func = function() return self.settings.calendar_show_histogram end,
+                        callback = function()
+                            self.settings.calendar_show_histogram = not self.settings.calendar_show_histogram
+                        end,
+                    },
+                    {
+                        text = _("Allow browsing coming months"),
+                        checked_func = function() return self.settings.calendar_browse_future_months end,
+                        callback = function()
+                            self.settings.calendar_browse_future_months = not self.settings.calendar_browse_future_months
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            -- @translators %1 is the time in the format 00:00
+                            return T(_("Daily timeline starts at %1"),
+                                string.format("%02d:%02d", self.settings.calendar_day_start_hour or 0,
+                                                           self.settings.calendar_day_start_minute or 0)
+                            )
+                        end,
                         callback = function(touchmenu_instance)
                             local DateTimeWidget = require("ui/widget/datetimewidget")
-                            UIManager:show(DateTimeWidget:new{ hour = self.settings.calendar_day_start_hour or 0, min = self.settings.calendar_day_start_minute or 0, min_max = 50, min_step = 10, min_hold_step = 30, ok_text = _("Set time"), title_text = _("Daily timeline starts at"), callback = function(time) self.settings.calendar_day_start_hour = time.hour; self.settings.calendar_day_start_minute = time.min; touchmenu_instance:updateItems() end })
+                            local start_of_day_widget = DateTimeWidget:new{
+                                hour = self.settings.calendar_day_start_hour or 0,
+                                min = self.settings.calendar_day_start_minute or 0,
+                                min_max = 50,
+                                min_step = 10, -- we have vertical lines every 10mn, keep them meaningful
+                                min_hold_step = 30,
+                                ok_text = _("Set time"),
+                                title_text = _("Daily timeline starts at"),
+                                info_text =_([[
+Set the time when the daily timeline should start.
+
+If you read past midnight, and would like this reading session to be displayed on the same screen with your previous evening reading sessions, use a value such as 04:00.
+
+Time is in hours and minutes.]]),
+                                callback = function(time)
+                                    self.settings.calendar_day_start_hour = time.hour
+                                    self.settings.calendar_day_start_minute = time.min
+                                    touchmenu_instance:updateItems()
+                                end
+                            }
+                            UIManager:show(start_of_day_widget)
                         end,
                         keep_menu_open = true,
                     },
-                    { text = _("Also use in calendar view"), checked_func = function() return self.settings.calendar_use_day_time_shift end, callback = function() self.settings.calendar_use_day_time_shift = not self.settings.calendar_use_day_time_shift end, separator = true },
                     {
-                        text = _("Cloud sync"),
-                        callback = function(touchmenu_instance)
-                            local server = self.settings.sync_server
-                            local edit_cb = function()
-                                local sync_settings = SyncService:new{}
-                                sync_settings.onClose = function(this) UIManager:close(this) end
-                                sync_settings.onConfirm = function(sv)
-                                    if server and (server.type ~= sv.type or server.url ~= sv.url or server.address ~= sv.address) then SyncService.removeLastSyncDB(db_location) end
-                                    self.settings.sync_server = sv; touchmenu_instance:updateItems()
-                                end
-                                UIManager:show(sync_settings)
-                            end
-                            if not server then edit_cb(); return end
-                            local dialogue
-                            local delete_button = { text = _("Delete"), callback = function() UIManager:close(dialogue); UIManager:show(ConfirmBox:new{ text = _("Delete server info?"), cancel_text = _("Cancel"), cancel_callback = function() return end, ok_text = _("Delete"), ok_callback = function() self.settings.sync_server = nil; SyncService.removeLastSyncDB(db_location); touchmenu_instance:updateItems() end }) end }
-                            local edit_button = { text = _("Edit"), callback = function() UIManager:close(dialogue); edit_cb() end }
-                            local close_button = { text = _("Close"), callback = function() UIManager:close(dialogue) end }
-                            local type = server.type == "dropbox" and " (DropBox)" or " (WebDAV)"
-                            dialogue = ButtonDialog:new{ title = T(_("Cloud storage:\n%1\n\nFolder path:\n%2\n\nSet up the same cloud folder on each device to sync across your devices."), server.name.." "..type, SyncService.getReadablePath(server)), buttons = { {delete_button, edit_button, close_button} } }
-                            UIManager:show(dialogue)
+                        text = _("Also use in calendar view"),
+                        checked_func = function() return self.settings.calendar_use_day_time_shift end,
+                        callback = function()
+                            self.settings.calendar_use_day_time_shift = not self.settings.calendar_use_day_time_shift
                         end,
-                        enabled_func = function() return self.settings.is_enabled end,
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            local text = self.ui.cloudstorage and self.ui.cloudstorage:getServerNameType(self.settings.sync_server)
+                            return T(_("Cloud sync: %1"), text or _("not set"))
+                        end,
+                        callback = function(touchmenu_instance)
+                            self:setSyncRemoteFolder(touchmenu_instance)
+                        end,
+                        enabled_func = function()
+                            return self:canSync(true)
+                        end,
                         keep_menu_open = true,
                     },
                 },
             },
-            { text = _("Reset statistics"), sub_item_table = self:genResetBookSubItemTable(), separator = true },
-            { text = _("Synchronize now"), callback = function() self:onSyncBookStats() end, enabled_func = function() return self:canSync() end, keep_menu_open = true, separator = true },
-            { text = _("Current book"), keep_menu_open = true, callback = function() self.kv = KeyValuePage:new{ title = _("Current statistics"), kv_pairs = self:getCurrentStat(), value_align = "right", single_page = true }; UIManager:show(self.kv) end, enabled_func = function() return self:isEnabled() end },
-            { text = _("Reading progress"), keep_menu_open = true, callback = function() self:onShowReaderProgress() end },
-            { text = _("Time range"), keep_menu_open = true, callback = function() self:onShowTimeRange() end },
-            { text = _("Calendar view"), keep_menu_open = true, callback = function() self:onShowCalendarView() end },
-            { text = _("Today's timeline"), keep_menu_open = true, callback = function() self:onShowCalendarDayView() end },
+            {
+                text = _("Reset statistics"),
+                sub_item_table = self:genResetBookSubItemTable(),
+                separator = true,
+            },
+            {
+                text = _("Sync now"),
+                callback = function()
+                    self:onSyncBookStats()
+                end,
+                enabled_func = function()
+                    return self:canSync()
+                end,
+                keep_menu_open = true,
+                separator = true,
+            },
+            {
+                text = _("Current book"),
+                keep_menu_open = true,
+                callback = function()
+                    self.kv = KeyValuePage:new{
+                        title = _("Current statistics"),
+                        kv_pairs = self:getCurrentStat(),
+                        value_align = "right",
+                        single_page = true,
+                    }
+                    UIManager:show(self.kv)
+                end,
+                enabled_func = function() return self:isEnabled() end,
+            },
+            {
+                text = _("Reading progress"),
+                keep_menu_open = true,
+                callback = function()
+                    self:onShowReaderProgress()
+                end,
+            },
+            {
+                text = _("Time range"),
+                keep_menu_open = true,
+                callback = function()
+                    self:onShowTimeRange()
+                end,
+            },
+            {
+                text = _("Calendar view"),
+                keep_menu_open = true,
+                callback = function()
+                    self:onShowCalendarView()
+                end,
+            },
+            {
+                text = _("Today's timeline"),
+                keep_menu_open = true,
+                callback = function()
+                    self:onShowCalendarDayView()
+                end,
+            },
         },
     }
 end
@@ -2091,6 +2269,7 @@ function ReaderStatistics:getCurrentStat()
     ]]
     local total_days = conn:rowexec(string.format(sql_stmt, id_book))
 
+    -- NOTE: Here, we generally want to account for the *full* amount of time spent reading this book.
     sql_stmt = [[
         SELECT sum(duration),
                count(DISTINCT page),
@@ -2101,13 +2280,16 @@ function ReaderStatistics:getCurrentStat()
     local total_time_book, total_read_pages, first_open = conn:rowexec(string.format(sql_stmt, id_book))
     conn:close()
 
+    -- NOTE: But, as the "Average time per page" entry is already re-using self.avg_time,
+    --       which is computed slightly differently (c.f., insertDB), we'll be using this tweaked book read time
+    --       to compute the other time-based statistics...
     local __, book_read_time = self:getPageTimeTotalStats(id_book)
     local now_ts = os.time()
 
     total_time_book = tonumber(total_time_book) or 0
     total_read_pages = tonumber(total_read_pages) or 0
     first_open = first_open or now_ts
-    
+   
     local physical_pages = self.ui.doc_settings:readSetting("yanllsama_physical_pages")
     if physical_pages then
         self.data.pages = physical_pages
@@ -2140,7 +2322,7 @@ function ReaderStatistics:getCurrentStat()
         end
     else
         current_page = self.ui:getCurrentPage()
-        
+      
         if physical_pages then
             local ratio = self.ui.doc_settings:readSetting("yanllsama_screen_ratio") or 1
             if self.ui.doc_settings:readSetting("pagemap_chars_per_synthetic_page") then ratio = 1.0 end
@@ -2157,12 +2339,14 @@ function ReaderStatistics:getCurrentStat()
     local time_to_read = current_page and ((total_pages - current_page) * self.avg_time) or 0
     local estimate_days_to_read = math.ceil(time_to_read/(book_read_time/tonumber(total_days)))
     local estimate_end_of_read_date = datetime.secondsToDate(tonumber(now_ts + estimate_days_to_read * 86400), true)
-    local estimates_valid = time_to_read > 0
+    local estimates_valid = time_to_read > 0 -- above values could be 'nan' and 'nil'
     local user_duration_format = G_reader_settings:readSetting("duration_format", "classic")
     local avg_page_time_string = datetime.secondsToClockDuration(user_duration_format, self.avg_time, false)
     local avg_day_time_string = datetime.secondsToClockDuration(user_duration_format, book_read_time/tonumber(total_days), false)
     local time_to_read_string = estimates_valid and datetime.secondsToClockDuration(user_duration_format, time_to_read, false) or _("N/A")
 
+    -- Use more_arrow to indicate that an option shows another view
+    -- Use " ⓘ" to indicate that an option will show an info message
     local more_arrow = BD.mirroredUILayout() and "◂" or "▸"
 
     local estimated_popup = function()
@@ -2174,6 +2358,7 @@ function ReaderStatistics:getCurrentStat()
         })
     end
 
+    -- Replace estimates for finished/frozen books
     local estimated_time_left, estimated_finish_date
     if self.is_doc_not_frozen then
         estimated_time_left = { _("Estimated reading time left") .. " ⓘ", time_to_read_string, callback = estimated_popup }
@@ -2187,9 +2372,13 @@ function ReaderStatistics:getCurrentStat()
     estimated_finish_date.separator = true
 
     return {
+        -- Global statistics (may consider other books than current book)
+
+        -- Since last resume
         { _("Time spent reading this session"), datetime.secondsToClockDuration(user_duration_format, current_duration, false) },
         { _("Pages read this session"), tonumber(current_pages), separator = true },
 
+        -- Today
         { _("Time spent reading today") .. " " .. more_arrow, datetime.secondsToClockDuration(user_duration_format, today_duration, false),
             callback = function()
                 local CalendarView = require("calendarview")
@@ -2201,10 +2390,16 @@ function ReaderStatistics:getCurrentStat()
         },
         { _("Pages read today"), tonumber(today_pages), separator = true },
 
+        -- Current book statistics (includes re-reads)
+
+        -- Time-focused book stats
         { _("Total time spent on this book"), datetime.secondsToClockDuration(user_duration_format, total_time_book, false) },
+        -- capped to self.settings.max_sec per distinct page
         { _("Time spent reading"), datetime.secondsToClockDuration(user_duration_format, book_read_time, false) },
+        -- estimation, from current page to end of book
         estimated_time_left,
 
+        -- Day-focused book stats
         { _("Days reading this book") .. " " .. more_arrow, tonumber(total_days),
             callback = function()
                 local kv = self.kv
@@ -2224,20 +2419,25 @@ function ReaderStatistics:getCurrentStat()
         },
         { _("Average time per day"), avg_day_time_string, separator = true },
 
+        -- Date-focused book stats
         { _("Book start date"), T(N_("(1 day ago) %2", "(%1 days ago) %2", first_open_days_ago), first_open_days_ago, datetime.secondsToDate(tonumber(first_open), true)) },
         estimated_finish_date,
 
+        -- Page-focused book stats
         { _("Current page/Total pages"), page_progress_string },
         { _("Pages read"), string.format("%d (%d%%)", total_read_pages, Math.round(100*total_read_pages/self.data.pages)) },
         { _("Average time per page"), avg_page_time_string, separator = true },
 
+        -- Highlights and notes
         { _("Book highlights"), tonumber(highlights) },
         { _("Book notes"), tonumber(notes) },
     }
 end
 
 function ReaderStatistics:getBookStat(id_book)
-    if id_book == nil then return end
+    if id_book == nil then
+        return
+    end
     local conn = SQ3.open(db_location)
     local sql_stmt = [[
         SELECT title, authors, pages, last_open, highlights, notes
@@ -2246,6 +2446,13 @@ function ReaderStatistics:getBookStat(id_book)
     ]]
     local title, authors, pages, last_open, highlights, notes = conn:rowexec(string.format(sql_stmt, id_book))
 
+    -- Due to some bug, some books opened around April 2020 might
+    -- have notes and highlight NULL in the DB.
+    -- See: https://github.com/koreader/koreader/issues/6190#issuecomment-633693940
+    -- (We made these last in the SQL so NULL/nil doesn't prevent
+    -- fetching the other fields.)
+    -- Show "?" when these values are not known (they will be
+    -- fixed next time this book is opened).
     highlights = highlights and tonumber(highlights) or "?"
     notes = notes and tonumber(notes) or "?"
 
@@ -2260,6 +2467,7 @@ function ReaderStatistics:getBookStat(id_book)
     ]]
     local total_days = conn:rowexec(string.format(sql_stmt, id_book))
 
+    -- NOTE: Same general principle as getCurrentStat
     sql_stmt = [[
         SELECT sum(duration),
                count(DISTINCT page),
@@ -2274,17 +2482,20 @@ function ReaderStatistics:getBookStat(id_book)
     local book_read_pages, book_read_time = self:getPageTimeTotalStats(id_book)
     local now_ts = os.time()
 
-    if total_time_book == nil then total_time_book = 0 end
-    if total_read_pages == nil then total_read_pages = 0 end
-    if first_open == nil then first_open = now_ts end
+    if total_time_book == nil then
+        total_time_book = 0
+    end
+    if total_read_pages == nil then
+        total_read_pages = 0
+    end
+    if first_open == nil then
+        first_open = now_ts
+    end
     total_time_book = tonumber(total_time_book)
     total_read_pages = tonumber(total_read_pages)
     last_page = tonumber(last_page) or 0
     pages = tonumber(pages) or 1
 
-    -- ==========================================
-    -- yanllsama: Geçmiş Kitaplar İçin Fiziksel Sayfa Kilidi
-    -- ==========================================
     local physical_pages = nil
     local ratio = 1
     
@@ -2298,21 +2509,23 @@ function ReaderStatistics:getBookStat(id_book)
         pages = physical_pages
         last_page = math.max(1, math.ceil(last_page / ratio))
         if last_page > pages then last_page = pages end
-        
         if total_read_pages > pages then total_read_pages = pages end
     end
-    -- ==========================================
-
     local first_open_days_ago = math.floor(tonumber(now_ts - first_open)/86400)
     local last_open_days_ago = math.floor(tonumber(now_ts - last_open)/86400)
     local avg_time_per_page = book_read_time / book_read_pages
     local user_duration_format = G_reader_settings:readSetting("duration_format")
     local more_arrow = BD.mirroredUILayout() and "◂" or "▸"
     return {
+        -- Book metadata
         { _("Title"), title},
         { _("Author(s)"), authors, separator = true },
+
+        -- Time-focused book stats
         { _("Total time spent on this book"), datetime.secondsToClockDuration(user_duration_format, total_time_book, false) },
         { _("Time spent reading"), datetime.secondsToClockDuration(user_duration_format, book_read_time, false), separator = true },
+
+        -- Day-focused book stats
         { _("Days reading this book") .. " " .. more_arrow, tonumber(total_days),
             callback = function()
                 local kv = self.kv
@@ -2331,11 +2544,17 @@ function ReaderStatistics:getBookStat(id_book)
             end,
         },
         { _("Average time per day"), datetime.secondsToClockDuration(user_duration_format, book_read_time/tonumber(total_days), false), separator = true },
+
+        -- Date-focused book stats
         { _("Book start date"), T(N_("(1 day ago) %2", "(%1 days ago) %2", first_open_days_ago), first_open_days_ago, datetime.secondsToDate(tonumber(first_open), true)) },
         { _("Last read date"), T(N_("(1 day ago) %2", "(%1 days ago) %2", last_open_days_ago), last_open_days_ago, datetime.secondsToDate(tonumber(last_open), true)), separator = true },
+
+        -- Page-focused book stats
         { _("Last read page/Total pages"), string.format("%d / %d (%d%%)", last_page, pages, Math.round(100*last_page/pages)) },
         { _("Pages read"), string.format("%d (%d%%)", total_read_pages, Math.round(100*total_read_pages/pages)) },
         { _("Average time per page"), datetime.secondsToClockDuration(user_duration_format, avg_time_per_page, false), separator = true },
+
+        -- Highlights
         { _("Book highlights"), highlights },
         { _("Book notes"), notes },
     }
@@ -3114,42 +3333,27 @@ function ReaderStatistics:onPageUpdate(pageno)
     end
 
     if self._reading_paused_ts then
+        -- Reading paused: don't update stats, but remember the current
+        -- page for when reading resumed.
         self._reading_paused_curr_page = pageno
         return
     end
 
+    -- We only care about *actual* page turns ;)
     if self.curr_page == pageno then
         return
     end
 
     local closing = false
-    if pageno == false then
+    if pageno == false then -- from onCloseDocument()
         closing = true
-        pageno = self.curr_page
+        pageno = self.curr_page -- avoid issues in following code
     end
-
     local is_pdf = false
     if self.document and self.document.file then
         is_pdf = string.match(string.lower(self.document.file), "%.pdf$") ~= nil
     end
 
-    -- ==========================================
-    -- yanllsama: Ninja Motor v4 – Fiziksel Sayfa Senkronizasyonu
-    --
-    -- TEMEL PRENSİP:
-    --   Pagemap modu (sentetik veya gerçek) aktifse:
-    --     getCurrentPageLabel() ile KOReader'ın kullanıcıya gösterdiği
-    --     fiziksel sayfa numarasını doğrudan oku. Bu binary search veya
-    --     global ratio hesabından çok daha doğrudur.
-    --   Pagemap yoksa: ratio ile tahmin et (eski davranış).
-    --
-    -- CACHE MANTIĞI:
-    --   Her çağrıda yeni sayfanın label'ını oku ve _yanllsama_phys_label_now
-    --   olarak sakla. Bir sonraki çağrıda bu değer önceki fiziksel sayfa
-    --   (phys_prev) olarak kullanılır.
-    -- ==========================================
-
-    -- ---- Ninja Motor v4 ayarlarını oku ----
     local SCREENS_PER_PAGE = 1.0
     local sync_enabled = false
     local physical_pages_locked = nil
@@ -3273,9 +3477,8 @@ function ReaderStatistics:onPageUpdate(pageno)
     self.pageturn_count = self.pageturn_count + 1
     local now_ts = os.time()
 
-    -- ---- Kayıt için sayfa anahtarlarını belirle ----
-    -- sync_enabled ve _phys_curr set edilmişse fiziksel; yoksa CRE ekranı kullan.
-    local stat_curr_page = self.curr_page
+    -- Get the previous page's last timestamp (if there is one)
+        local stat_curr_page = self.curr_page
     local stat_next_page = pageno
     local max_phys_fb = physical_pages_locked or self.data.pages or 9999
     if sync_enabled then
@@ -3300,15 +3503,15 @@ function ReaderStatistics:onPageUpdate(pageno)
     end
 
     local page_data  = self.page_stat[stat_curr_page]
+    -- This is a list of tuples, in insertion order, we want the last one
     local data_tuple = page_data and page_data[#page_data]
-    local then_ts    = data_tuple and data_tuple[1]
-
+    -- Tuple layout is { timestamp, duration }
+    local then_ts = data_tuple and data_tuple[1]
+    -- If we don't have a previous timestamp to compare to, abort early
     if not then_ts then
         logger.dbg("ReaderStatistics: No timestamp for previous page", stat_curr_page)
-        -- İlk sayfa açılışı: stat_next_page için timestamp aç
         self.page_stat[stat_next_page] = { { now_ts, 0 } }
         self.curr_page = pageno
-        -- Pagemap modu: cache'i başlat
         if use_pagemap_mode and self.ui.pagemap then
             local lbl_init = self.ui.pagemap:getCurrentPageLabel(true)
             self._yanllsama_phys_label_prev = lbl_init and tonumber(lbl_init)
@@ -3323,6 +3526,7 @@ function ReaderStatistics:onPageUpdate(pageno)
         return
     end
 
+    -- Compute the difference between now and the previous page's last timestamp
     local diff_time = now_ts - then_ts
     local valid_time = 0
 
@@ -3381,22 +3585,29 @@ function ReaderStatistics:onPageUpdate(pageno)
         return
     end
 
+    -- We want a flush to db every 50 page turns
     if self.pageturn_count >= MAX_PAGETURNS_BEFORE_FLUSH then
+        -- I/O, delay until after the pageturn, but reset the count now, to avoid potentially scheduling multiple inserts...
         self.pageturn_count = 0
         UIManager:tickAfterNext(function()
             self:insertDB()
+            -- insertDB will call resetVolatileStats for us ;)
         end)
     end
 
+    -- Update average time per page (if need be, insertDB will have updated the totals and cleared the volatiles)
+    -- NOTE: Until insertDB runs, while book_read_pages only counts *distinct* pages,
+    --       and while mem_read_pages does the same, there may actually be an overlap between the two!
+    --       (i.e., the same page may be counted as read both in total and in mem, inflating the pagecount).
+    --       Only insertDB will actually check that the count (and as such average time) is actually accurate.
     if self.book_read_pages > 0 or self.mem_read_pages > 0 then
         self.avg_time = (self.book_read_time + self.mem_read_time) / (self.book_read_pages + self.mem_read_pages)
     end
 
-    -- curr_page güncelle (her zaman CRE ekran numarasını sakla)
+    -- We're done, update the current page tracker
     self.curr_page = pageno
-
-    -- Pagemap modu: yeni sayfanın fiziksel label'ını cache'e al
-    -- (bir sonraki onPageUpdate çağrısında phys_prev olarak kullanılacak)
+    -- And, in the new page's list, append a new tuple with the current timestamp and a placeholder duration
+    -- (duration will be computed on next pageturn)
     if use_pagemap_mode and self.ui.pagemap then
         local lbl_next = self.ui.pagemap:getCurrentPageLabel(true)
         self._yanllsama_phys_label_prev = lbl_next and tonumber(lbl_next)
@@ -3410,7 +3621,6 @@ function ReaderStatistics:onPageUpdate(pageno)
         self.page_stat[stat_next_page] = { { now_ts, 0 } }
     end
 
-    -- Geçici fiziksel sayfa değişkenlerini temizle
     self._phys_curr     = nil
     self._phys_next     = nil
     self._screen_pageno = nil
@@ -3435,7 +3645,6 @@ end
 function ReaderStatistics:onCloseDocument()
     self:onPageUpdate(false) -- update current page duration
     self:insertDB()
-    -- yanllsama: Ninja Motor v4 cache'lerini temizle (yeni kitap acildiginda yeniden yuklensin)
     self._yanllsama_pagemap_list = nil
     self._yanllsama_phys_label_prev = nil
     _G.yanllsama_current_physical_pages = nil
@@ -3482,7 +3691,6 @@ function ReaderStatistics:onReadingResumed()
         if self._reading_paused_ts then
             -- Just add the pause duration to the current page start_time
             local pause_duration = os.time() - self._reading_paused_ts
-            -- yanllsama: sync_enabled durumunda page_stat fiziksel numaralarla anahtarlanıyor
             local _pause_stat_key = self.curr_page
             if self.ui and self.ui.doc_settings then
                 local ratio = self.ui.doc_settings:readSetting("yanllsama_screen_ratio")
@@ -3519,7 +3727,6 @@ function ReaderStatistics:onReadingResumed()
     self._reading_paused_ts = nil
 end
 
-
 function ReaderStatistics:onReaderReady(config)
     if self.settings.is_enabled then
         self.data = config:readSetting("stats", { performance_in_pages = {} })
@@ -3528,7 +3735,6 @@ function ReaderStatistics:onReaderReady(config)
         self:initData()
         self.view.footer:maybeUpdateFooter()
     end
-    -- yanllsama: Konum tabanli baraj modu oturum-arasi sayac gerektirmez.
 end
 
 function ReaderStatistics:onShowCalendarView()
@@ -3781,7 +3987,7 @@ function ReaderStatistics:getCurrentBookReadPages()
         SELECT
           page,
           min(sum(duration), ?) AS durations,
-          strftime("%s", "now") - max(start_time) AS delay
+          strftime('%s', 'now') - max(start_time) AS delay
         FROM page_stat
         WHERE id_book = ?
         GROUP BY page
@@ -3808,9 +4014,6 @@ function ReaderStatistics:getCurrentBookReadPages()
         -- Make the value a duration ratio (vs capped or max duration)
         read_pages[page][1] = info[1] / max_duration
     end
-
-
-
     return read_pages
 end
 
@@ -3821,21 +4024,81 @@ function ReaderStatistics:getTimeForPages(pages)
     end
 end
 
-function ReaderStatistics:canSync()
-    return self.settings.sync_server ~= nil and self.settings.is_enabled
+-- cloud sync (Cloud storage plugin required)
+
+function ReaderStatistics:canSync(no_server_check)
+    return self.settings.is_enabled and self.ui.cloudstorage ~= nil
+        and (no_server_check or self.settings.sync_server ~= nil)
+end
+
+function ReaderStatistics:setSyncRemoteFolder(touchmenu_instance)
+    local cs = self.ui.cloudstorage
+    local server = self.settings.sync_server
+    local dialogue
+    local buttons = {
+        {
+            {
+                text = _("Delete"),
+                enabled = server and true or false,
+                callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = _("Delete server info?"),
+                        ok_text = _("Delete"),
+                        ok_callback = function()
+                            UIManager:close(dialogue)
+                            self.settings.sync_server = nil
+                            os.remove(db_location .. ".sync")
+                            touchmenu_instance:updateItems()
+                        end,
+                    })
+                end,
+            },
+            {
+                text = _("Edit"),
+                callback = function()
+                    UIManager:close(dialogue)
+                    cs:onShowCloudStorageList(function(sv)
+                        self.settings.sync_server = sv
+                        if server and (server.type ~= sv.type or server.url ~= sv.url or server.address ~= sv.address) then
+                            os.remove(db_location .. ".sync")
+                        end
+                        touchmenu_instance:updateItems()
+                        self:setSyncRemoteFolder(touchmenu_instance) -- keep the dialog open
+                    end)
+                end,
+            },
+            {
+                text = _("Close"),
+                callback = function()
+                    UIManager:close(dialogue)
+                end,
+            },
+        },
+    }
+    local text = cs:getServerNameType(server) or _("not set")
+    if server then
+        text = text .. "\n\n" .. T(_("Folder path:\n%1"), cs.getReadablePath(server))
+                    .. "\n\n" .. _("Set up the same cloud folder on each device to sync across your devices.")
+    end
+    dialogue = ButtonDialog:new{
+        title = T(_("Cloud storage: %1"), text),
+        buttons = buttons,
+    }
+    UIManager:show(dialogue)
 end
 
 function ReaderStatistics:onSyncBookStats()
-    if not self:canSync() then return end
-
-    UIManager:show(InfoMessage:new {
-        text = _("Syncing book statistics. This may take a while."),
-        timeout = 1,
-    })
-
-    UIManager:nextTick(function()
-        SyncService.sync(self.settings.sync_server, db_location, self.onSync)
-    end)
+    if self:canSync() then
+        local caller_pre_callback = function()
+            UIManager:show(InfoMessage:new {
+                text = _("Syncing book statistics…"),
+                timeout = 1,
+            })
+        end
+        UIManager:nextTick(function()
+            self.ui.cloudstorage:sync(self.settings.sync_server, db_location, self.onSync, nil, caller_pre_callback)
+        end)
+    end
 end
 
 function ReaderStatistics.onSync(local_path, cached_path, income_path)
@@ -3969,37 +4232,6 @@ function ReaderStatistics.onSync(local_path, cached_path, income_path)
     conn:exec("DETACH income_db;"..(attached_cache and "DETACH cached_db;" or ""))
     conn:close()
     return true
-end
-
--- Yanllsama: Kopan ac/kapat salterini yerine taktik
-function ReaderStatistics:onToggleStatistics(enable)
-    if enable ~= nil and enable == self.settings.is_enabled then return end
-    
-    self.settings.is_enabled = enable == nil and not self.settings.is_enabled or enable
-    G_reader_settings:saveSetting("statistics", self.settings)
-    
-    -- === MİMARIN DİL MOTORU ===
-    local lang = G_reader_settings and G_reader_settings:readSetting("language") or "en"
-    local is_tr = (string.sub(lang, 1, 2) == "tr")
-    
-    if self.settings.is_enabled then
-        if self.document then
-            self:initData()
-        end
-        UIManager:show(InfoMessage:new{
-            text = is_tr and "Okuma istatistikleri açıldı." or "Reading statistics enabled.",
-            timeout = 2,
-        })
-    else
-        UIManager:show(InfoMessage:new{
-            text = is_tr and "Okuma istatistikleri kapatıldı." or "Reading statistics disabled.",
-            timeout = 2,
-        })
-    end
-    
-    if self.ui.menu then
-        self.ui.menu:updateConfig("statistics")
-    end
 end
 
 return ReaderStatistics
